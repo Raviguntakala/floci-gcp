@@ -673,12 +673,14 @@ Versions are derived from Conventional Commits by [semantic-release](https://git
 
 IAM policies are stored without enforcement by default. For local permission tests,
 set `FLOCI_GCP_SERVICES_IAM_AUTHORIZATION_MODE=enforce` and use Floci-issued
-service-account tokens. This enforces Resource Manager v1 project metadata/policies
-and supported GCS REST bucket and object operations through one shared evaluator. Project
-policies are also enforced through the shared IAM gRPC mixin. Resource Manager
-bypasses anonymous/external credentials; GCS evaluates them as anonymous so `allUsers`
-bindings work. Pub/Sub, Secret Manager, GCS ACLs, GCS gRPC, and all other services
-remain unenforced. Read the
+service-account tokens. This enforces Resource Manager v1 project metadata/policies,
+Cloud Run v2 service and revision REST operations and service policies, Secret
+Manager REST and gRPC operations, and supported GCS REST bucket and object operations
+through one shared evaluator. Project and Cloud Run service policies also use the
+shared IAM gRPC API. Resource Manager, Cloud Run, and Secret Manager bypass
+anonymous/external credentials; GCS evaluates them as anonymous so `allUsers`
+bindings work. Pub/Sub, Cloud Run jobs, worker pools, instances, invocation and
+operations, GCS ACLs, GCS gRPC, and all other services remain unenforced. Read the
 [coverage and limitations](docs/services/iam.md#opt-in-enforcement) before treating a
 green test as evidence of least privilege.
 
