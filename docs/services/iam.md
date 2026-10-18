@@ -112,7 +112,7 @@ and when evaluating previously stored project policies. Disabled mode retains
 permissive policy storage.
 
 The finite catalog also contains `roles/storage.objectViewer`,
-`roles/storage.objectCreator`, `roles/storage.objectAdmin`, and
+`roles/storage.objectCreator`, `roles/storage.objectUser`, `roles/storage.objectAdmin`, and
 `roles/storage.admin` for the explicitly enforced bucket and object permissions.
 Secret Manager roles, permission targets, and inheritance are described in the
 [Secret Manager guide](secret-manager.md#iam-enforcement).
