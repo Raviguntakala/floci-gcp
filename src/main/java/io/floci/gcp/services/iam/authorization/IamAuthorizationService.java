@@ -66,7 +66,7 @@ public class IamAuthorizationService {
         LOG.warnf("IAM authorization mode=%s; supported services=%s. "
                         + "Identity handling is service-specific; GCS bucket policies evaluate anonymous callers. "
                         + "Enforce mode covers Cloud Run v2 service/revision REST, service-policy REST and shared IAM gRPC, "
-                        + "and Secret Manager REST/gRPC. Pub/Sub, Cloud Run jobs/instances/worker pools/invocation, "
+                        + "and Secret Manager REST/gRPC. Cloud Run jobs/instances/worker pools/invocation, "
                         + "GCS ACLs, GCS gRPC and all other services are NOT IAM-enforced. "
                         + "GCS Credential Access Boundary checks remain active.",
                 config.services().iam().authorizationMode(), registry.adapters().stream()

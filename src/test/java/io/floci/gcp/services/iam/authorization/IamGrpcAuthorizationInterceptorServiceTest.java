@@ -24,7 +24,7 @@ class IamGrpcAuthorizationInterceptorServiceTest {
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     @SuppressWarnings("unchecked")
-    void extensionServiceIsAuthorizedBeforeItsRequestReachesTheHandler(boolean denied) {
+    void extensionServiceIsAuthorizedBeforeItsRequestReachesTheHandler(boolean denied) throws Exception {
         IamAuthorizationAdapter adapter = mock(IamAuthorizationAdapter.class);
         when(adapter.restControllers()).thenReturn(Set.of());
         when(adapter.grpcServices()).thenReturn(Set.of("example.v1.Service"));

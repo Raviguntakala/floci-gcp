@@ -7,12 +7,11 @@ The global-interceptor annotation also covers Quarkus-managed registrations.
 An annotation alone does not cover the dynamically bound controllers.
 
 Resource Manager projects, Cloud Run v2 services and revisions, Secret Manager
-secrets and versions, and GCS bucket/object operations are integrated. Cloud Run
+secrets and versions, Pub/Sub, and GCS bucket/object operations are integrated. Cloud Run
 service-policy methods use REST and the shared IAM gRPC API. Secret Manager secret
 policy methods work over REST and gRPC. GCS invokes the shared evaluator from its
 service-level authorization path so JSON filtering does not bypass its
 lock-sensitive lifecycle coordination.
-Pub/Sub IAM enforcement is not supported.
 
 ## Service extension contract
 
@@ -52,7 +51,9 @@ The current REST transport adapter buffers and restores JSON request bodies. It
 is not an XML, multipart, raw-media, or HTTP/protobuf authorization parser. Add an
 appropriate transport adapter for those formats while retaining the shared decision
 point. Likewise, streams that address resources after their initial message need
-explicit state handling and tests. The authorization interceptor does not support StreamingPull.
+explicit state handling and tests. Pub/Sub StreamingPull retains the first
+subscription name, checks every message and delivery, and rejects a repeated
+subscription field in later messages.
 GCS intentionally does not register its REST controllers with that filter. Its
 authorization service calls the same evaluator after applying GCS-specific
 credential handling. XML, media, upload, and service-layer paths use that entry

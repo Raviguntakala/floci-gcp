@@ -32,6 +32,16 @@ public interface IamAuthorizationAdapter {
         throw unsupported("gRPC operation " + method);
     }
 
+    /** A service-owned mapping for requests that share a resource across a gRPC stream. */
+    default Optional<GrpcStreamAuthorization> grpcStreamAuthorization(String method) {
+        return Optional.empty();
+    }
+
+    @FunctionalInterface
+    interface GrpcStreamAuthorization {
+        IamOperation requestOperation(Message request, IamOperation previous);
+    }
+
     List<IamPermissionCheck> checks(IamOperation operation);
 
     Optional<IamResource> resource(String name);
