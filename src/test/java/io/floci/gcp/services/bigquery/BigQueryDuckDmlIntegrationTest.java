@@ -238,6 +238,88 @@ class BigQueryDuckDmlIntegrationTest {
     }
 
     @Test
+    @Order(3)
+    void correlatedSubqueriesInNotMatchedClausesFailLikeBigQuery() {
+        query("CREATE TABLE shop.corr_s AS SELECT 1 AS id, 'a' AS k, 'src1' AS v UNION ALL SELECT 2, 'b', 'src2'")
+                .then().statusCode(200);
+        query("CREATE TABLE shop.corr_t (id INT64, k STRING, v STRING)").then().statusCode(200);
+        query("CREATE TABLE shop.corr_lookup AS SELECT 'a' AS lk, 'name_a' AS name UNION ALL SELECT 'b', 'name_b'")
+                .then().statusCode(200);
+        query("CREATE TABLE shop.corr_lookup_k AS SELECT 'a' AS k, 'inner_a' AS name UNION ALL SELECT 'zzz', 'inner_zzz'")
+                .then().statusCode(200);
+        String merge = "MERGE shop.corr_t T USING shop.corr_s S ON T.id = S.id WHEN NOT MATCHED";
+
+        query(merge + " THEN INSERT (id, k, v) VALUES (id, k, (SELECT name FROM shop.corr_lookup WHERE lk = k))")
+                .then().statusCode(400)
+                .body("error.message", containsString("Correlated Subquery is unsupported in INSERT clause."));
+        query(merge + " AND EXISTS (SELECT 1 FROM shop.corr_lookup WHERE lk = k AND name = 'name_b')"
+                + " THEN INSERT (id, k) VALUES (id, k)")
+                .then().statusCode(400)
+                .body("error.message", containsString("Correlated Subquery is unsupported in WHEN clause."));
+        query(merge + " THEN INSERT (id, v) VALUES (id, (SELECT name FROM shop.corr_lookup_k l WHERE l.k = S.k))")
+                .then().statusCode(400)
+                .body("error.message", containsString("Correlated Subquery is unsupported in INSERT clause."));
+
+        query(merge + " AND EXISTS (SELECT 1 FROM shop.corr_lookup l WHERE l.lk = S.k"
+                + " AND EXISTS (SELECT 1 FROM shop.corr_lookup S)) THEN INSERT (id, k) VALUES (id, k)")
+                .then().statusCode(400)
+                .body("error.message", containsString("Correlated Subquery is unsupported in WHEN clause."));
+        query(merge + " THEN INSERT (id, v) VALUES (id, (SELECT MAX(l.name) FROM shop.corr_lookup l"
+                + " WHERE l.lk IN (SELECT k FROM shop.corr_lookup_k)))")
+                .then().statusCode(400)
+                .body("error.message", containsString("Correlated Subquery is unsupported in INSERT clause."));
+        query(merge + " AND k IN (SELECT lk FROM shop.corr_lookup) THEN INSERT (id, k) VALUES (id, k)")
+                .then().statusCode(400)
+                .body("error.message", containsString("Correlated Subquery is unsupported in WHEN clause."));
+        query("MERGE shop.corr_t T USING UNNEST([STRUCT(9 AS id, 'a' AS v)]) AS u ON T.id = u.id WHEN NOT MATCHED"
+                + " THEN INSERT (id, v) VALUES (id, (SELECT u.v))")
+                .then().statusCode(400)
+                .body("error.message", containsString("Correlated Subquery is unsupported in INSERT clause."));
+
+        query(merge + " THEN INSERT (id, v) VALUES (id, (SELECT MAX(name) FROM shop.corr_lookup_k WHERE k = 'a'))")
+                .then().statusCode(200);
+        assertEquals(List.of(List.of("1", "inner_a"), List.of("2", "inner_a")),
+                rows("SELECT id, v FROM shop.corr_t ORDER BY id"));
+
+        query("CREATE TABLE shop.corr_a AS SELECT 'x' AS a_col").then().statusCode(200);
+        query("CREATE TABLE shop.corr_b AS SELECT 'from_b' AS v").then().statusCode(200);
+        query("DELETE FROM shop.corr_t WHERE TRUE").then().statusCode(200);
+        query(merge + " THEN INSERT (id, v) VALUES (id, (SELECT MAX(v) FROM shop.corr_a, shop.corr_b))")
+                .then().statusCode(200);
+        assertEquals(List.of(List.of("1", "from_b"), List.of("2", "from_b")),
+                rows("SELECT id, v FROM shop.corr_t ORDER BY id"));
+        query("DELETE FROM shop.corr_t WHERE TRUE").then().statusCode(200);
+        query(merge + " THEN INSERT (id, v) VALUES (id, (SELECT MAX(name) AS v FROM shop.corr_lookup ORDER BY v LIMIT 1))")
+                .then().statusCode(200);
+        assertEquals(List.of(List.of("1", "name_b"), List.of("2", "name_b")),
+                rows("SELECT id, v FROM shop.corr_t ORDER BY id"));
+
+        query(merge + " THEN INSERT (id, v) VALUES (id, (SELECT MAX(name) AS v FROM shop.corr_lookup WHERE lk = v))")
+                .then().statusCode(400)
+                .body("error.message", containsString("Correlated Subquery is unsupported in INSERT clause."));
+        query("DELETE FROM shop.corr_t WHERE TRUE").then().statusCode(200);
+        query(merge + " AND ('a') IN (SELECT lk FROM shop.corr_lookup) THEN INSERT (id, k) VALUES (id, k)")
+                .then().statusCode(200);
+        assertEquals(List.of(List.of("1", "a"), List.of("2", "b")), rows("SELECT id, k FROM shop.corr_t ORDER BY id"));
+
+        query("CREATE TABLE shop.corr_lookup_d AS SELECT 'a' AS lk, 'name_a' AS name, DATE '2026-01-01' AS d"
+                + " UNION ALL SELECT 'b', 'name_b', DATE '2026-01-05'").then().statusCode(200);
+        for (String constantOperand : List.of("CAST('a' AS STRING) IN (SELECT lk FROM shop.corr_lookup_d)",
+                "SAFE_CAST('1' AS INT64) IN (SELECT 1)",
+                "DATE_SUB(DATE '2026-01-02', INTERVAL 1 DAY) IN (SELECT d FROM shop.corr_lookup_d)")) {
+            query("DELETE FROM shop.corr_t WHERE TRUE").then().statusCode(200);
+            query(merge + " AND " + constantOperand + " THEN INSERT (id, k) VALUES (id, k)").then().statusCode(200);
+            assertEquals(List.of(List.of("1", "a"), List.of("2", "b")), rows("SELECT id, k FROM shop.corr_t ORDER BY id"),
+                    constantOperand);
+        }
+        query("DELETE FROM shop.corr_t WHERE TRUE").then().statusCode(200);
+        query(merge + " THEN INSERT (id, v) VALUES (id, (SELECT MAX(name) v FROM shop.corr_lookup_d ORDER BY v LIMIT 1))")
+                .then().statusCode(200);
+        assertEquals(List.of(List.of("1", "name_b"), List.of("2", "name_b")),
+                rows("SELECT id, v FROM shop.corr_t ORDER BY id"));
+    }
+
+    @Test
     @Order(4)
     void ctasAndViews() {
         String ctasJob = query("CREATE TABLE shop.pricey AS SELECT id, name, price FROM shop.items WHERE price > 1")

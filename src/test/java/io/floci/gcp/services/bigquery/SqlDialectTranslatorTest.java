@@ -551,6 +551,127 @@ class SqlDialectTranslatorTest {
     }
 
     @Test
+    void notMatchedClausesQualifyOnlyTargetColumnsWhenTheSchemasAreKnown() {
+        String merge = dmlWithSchemas("MERGE ds.t T USING ds.s S ON T.id = S.id WHEN NOT MATCHED AND v > 0"
+                + " AND only_in_source > 0 THEN INSERT (id, v) VALUES (id, some_function_word)");
+        assertTrue(merge.contains("\"S\".v > 0") && merge.contains("VALUES (\"S\".id"), merge);
+        assertFalse(merge.contains("\"S\".only_in_source") || merge.contains("\"S\".some_function_word"), merge);
+    }
+
+    @Test
+    void aCorrelatedSubqueryInANotMatchedClauseIsRejectedLikeBigQuery() {
+        String merge = "MERGE ds.t T USING ds.s S ON T.id = S.id WHEN NOT MATCHED";
+        assertEquals("Correlated Subquery is unsupported in INSERT clause.", assertThrows(GcpException.class,
+                () -> dmlWithSchemas(merge + " THEN INSERT (id, v) VALUES (id, (SELECT name FROM ds.lookup WHERE lk = v))"))
+                .getMessage());
+        assertEquals("Correlated Subquery is unsupported in WHEN clause.", assertThrows(GcpException.class,
+                () -> dmlWithSchemas(merge + " AND EXISTS (SELECT 1 FROM ds.lookup l WHERE l.lk = S.v)"
+                        + " THEN INSERT (id) VALUES (id)")).getMessage());
+        assertEquals("Correlated Subquery is unsupported in INSERT clause.", assertThrows(GcpException.class,
+                () -> dml(merge + " THEN INSERT (id, v) VALUES (id, (SELECT name FROM ds.lookup l WHERE l.lk = T.v))"))
+                .getMessage());
+
+        String inner = dmlWithSchemas(merge + " THEN INSERT (id, v) VALUES (id, (SELECT MAX(name) FROM ds.lookup"
+                + " WHERE lk = 'a'))");
+        assertTrue(inner.contains("(SELECT MAX(name) FROM \"ds\".\"lookup\" WHERE lk = 'a')"), inner);
+    }
+
+    @Test
+    void notMatchedSubqueriesThatReadOnlyTheirOwnTablesAreAccepted() {
+        String merge = "MERGE ds.t T USING ds.s S ON T.id = S.id WHEN NOT MATCHED";
+        assertTrue(dmlWithSchemas(merge + " THEN INSERT (id, v) VALUES (id, (SELECT MAX(v) FROM ds.a, ds.b))")
+                .contains("(SELECT MAX(v) FROM \"ds\".\"a\", \"ds\".\"b\")"));
+        dmlWithSchemas(merge + " THEN INSERT (id, v) VALUES (id, (SELECT MAX(b.v) FROM ds.a a, ds.b b WHERE a.a_col = 'x'))");
+        dmlWithSchemas(merge + " THEN INSERT (id, v) VALUES (id, (SELECT MAX(name) AS v FROM ds.lookup ORDER BY v LIMIT 1))");
+        dmlWithSchemas(merge + " AND EXISTS (SELECT 1 FROM ds.lookup l WHERE EXISTS (SELECT 1 FROM ds.lookup WHERE name = 'x'))"
+                + " THEN INSERT (id) VALUES (id)");
+        dmlWithSchemas(merge + " THEN INSERT (id, v) VALUES (id, (SELECT MAX(name) FROM ds.lookup WHERE lk IN ('a')))");
+    }
+
+    @Test
+    void nestedInAndUnnestSourceCorrelationsAreRejectedLikeBigQuery() {
+        String merge = "MERGE ds.t T USING ds.s S ON T.id = S.id WHEN NOT MATCHED";
+        String when = "Correlated Subquery is unsupported in WHEN clause.";
+        String insert = "Correlated Subquery is unsupported in INSERT clause.";
+        assertEquals(when, assertThrows(GcpException.class, () -> dmlWithSchemas(merge + " AND EXISTS (SELECT 1 FROM ds.lookup l"
+                + " WHERE l.lk = S.v AND EXISTS (SELECT 1 FROM ds.lookup S)) THEN INSERT (id) VALUES (id)")).getMessage());
+        assertEquals(when, assertThrows(GcpException.class, () -> dmlWithSchemas(merge + " AND EXISTS (SELECT 1 FROM ds.lookup l"
+                + " WHERE EXISTS (SELECT 1 FROM ds.lookup m WHERE m.lk = v)) THEN INSERT (id) VALUES (id)")).getMessage());
+        assertEquals(insert, assertThrows(GcpException.class, () -> dmlWithSchemas(merge + " THEN INSERT (id, v) VALUES (id,"
+                + " (SELECT MAX(l.name) FROM ds.lookup l WHERE EXISTS (SELECT 1 FROM ds.b m WHERE m.v = l.lk)))")).getMessage());
+        assertEquals(insert, assertThrows(GcpException.class, () -> dmlWithSchemas(merge + " THEN INSERT (id, v) VALUES (id,"
+                + " (SELECT MAX(l.name) FROM ds.lookup l WHERE l.lk IN (SELECT v FROM ds.b)))")).getMessage());
+        assertEquals(when, assertThrows(GcpException.class, () -> dmlWithSchemas(merge
+                + " AND v IN (SELECT lk FROM ds.lookup) THEN INSERT (id) VALUES (id)")).getMessage());
+        assertEquals(insert, assertThrows(GcpException.class, () -> dmlWithSchemas(merge
+                + " THEN INSERT (id, v) VALUES (id, CASE WHEN v IN (SELECT lk FROM ds.lookup) THEN 'y' END)")).getMessage());
+
+        String subquerySource = "MERGE ds.t T USING (SELECT 1 AS id, 'a' AS k) S ON T.id = S.id WHEN NOT MATCHED";
+        assertEquals(when, assertThrows(GcpException.class, () -> dmlWithSchemas(subquerySource
+                + " AND k IN (SELECT 'a') THEN INSERT (id) VALUES (id)")).getMessage());
+        dmlWithSchemas(subquerySource + " AND CAST('a' AS STRING) IN (SELECT 'a') THEN INSERT (id) VALUES (id)");
+        dmlWithSchemas(subquerySource + " AND EXTRACT(DAY FROM DATE '2026-01-01') IN (SELECT 1) THEN INSERT (id) VALUES (id)");
+        assertEquals(when, assertThrows(GcpException.class, () -> dmlWithSchemas("MERGE ds.t T USING (SELECT 1 AS id, 'a' AS source) S"
+                + " ON T.id = S.id WHEN NOT MATCHED AND source IN (SELECT 'a') THEN INSERT (id) VALUES (id)")).getMessage());
+        assertEquals(insert, assertThrows(GcpException.class, () -> dmlWithSchemas("MERGE ds.t T USING (SELECT 1 AS id, 'a' AS v) S"
+                + " ON T.id = S.id WHEN NOT MATCHED THEN INSERT (id, v) VALUES (id, (SELECT MAX(name) FROM ds.lookup WHERE lk = v))"))
+                .getMessage());
+
+        String unnest = "MERGE ds.t T USING UNNEST([STRUCT(1 AS id, 'a' AS v)]) AS u ON T.id = u.id WHEN NOT MATCHED";
+        assertEquals(insert, assertThrows(GcpException.class,
+                () -> dmlWithSchemas(unnest + " THEN INSERT (id, v) VALUES (id, (SELECT u.v))")).getMessage());
+        assertEquals(insert, assertThrows(GcpException.class, () -> dmlWithSchemas(unnest
+                + " THEN INSERT (id, v) VALUES (id, (SELECT MAX(name) FROM ds.lookup WHERE lk = u.v))")).getMessage());
+        assertTrue(dmlWithSchemas(unnest + " THEN INSERT (id, v) VALUES (id, (SELECT MAX(name) FROM ds.lookup))")
+                .contains("VALUES (id, (SELECT MAX(name) FROM \"ds\".\"lookup\"))"));
+    }
+
+    @Test
+    void constantInOperandsAndNamesInsideParenthesizedJoinsAreNotCorrelations() {
+        String merge = "MERGE ds.t T USING ds.s S ON T.id = S.id WHEN NOT MATCHED";
+        dmlWithSchemas(merge + " AND ('a') IN (SELECT lk FROM ds.lookup) THEN INSERT (id) VALUES (id)");
+        dmlWithSchemas(merge + " AND UPPER('a') IN (SELECT UPPER(lk) FROM ds.lookup) THEN INSERT (id) VALUES (id)");
+        dmlWithSchemas(merge + " AND DATE '2026-01-01' IN (SELECT DATE '2026-01-01') THEN INSERT (id) VALUES (id)");
+        dmlWithSchemas(merge + " AND TIMESTAMP '2026-01-01 00:00:00' IN (SELECT TIMESTAMP '2026-01-01 00:00:00')"
+                + " THEN INSERT (id) VALUES (id)");
+        dmlWithSchemas(merge + " AND CAST('a' AS STRING) IN (SELECT lk FROM ds.lookup) THEN INSERT (id) VALUES (id)");
+        dmlWithSchemas(merge + " AND SAFE_CAST('1' AS INT64) IN (SELECT 1) THEN INSERT (id) VALUES (id)");
+        dmlWithSchemas(merge + " AND DATE_SUB(DATE '2026-01-02', INTERVAL 1 DAY) IN (SELECT lk FROM ds.lookup)"
+                + " THEN INSERT (id) VALUES (id)");
+        assertEquals("Correlated Subquery is unsupported in WHEN clause.", assertThrows(GcpException.class,
+                () -> dmlWithSchemas(merge + " AND CAST(v AS STRING) IN (SELECT lk FROM ds.lookup) THEN INSERT (id) VALUES (id)"))
+                .getMessage());
+        dmlWithSchemas(merge + " THEN INSERT (id, v) VALUES (id, (SELECT MAX(S.name) FROM (ds.s x JOIN ds.lookup S ON TRUE)))");
+        assertEquals("Correlated Subquery is unsupported in WHEN clause.", assertThrows(GcpException.class,
+                () -> dmlWithSchemas(merge + " AND UPPER(v) IN (SELECT lk FROM ds.lookup) THEN INSERT (id) VALUES (id)"))
+                .getMessage());
+    }
+
+    @Test
+    void aSelectListAliasHidesAnOuterColumnOnlyFromGroupByOn() {
+        String merge = "MERGE ds.t T USING ds.s S ON T.id = S.id WHEN NOT MATCHED THEN INSERT (id, v) VALUES (id, ";
+        assertEquals("Correlated Subquery is unsupported in INSERT clause.", assertThrows(GcpException.class,
+                () -> dmlWithSchemas(merge + "(SELECT MAX(name) AS v FROM ds.lookup WHERE lk = v))")).getMessage());
+        dmlWithSchemas(merge + "(SELECT lk AS v FROM ds.lookup GROUP BY v ORDER BY v LIMIT 1))");
+        dmlWithSchemas(merge + "(SELECT MAX(name) AS v FROM ds.lookup HAVING v IS NOT NULL))");
+        dmlWithSchemas(merge + "(SELECT lk AS v FROM ds.lookup QUALIFY ROW_NUMBER() OVER (ORDER BY v) = 1))");
+        dmlWithSchemas(merge + "(SELECT MAX(name) v FROM ds.lookup ORDER BY v LIMIT 1))");
+        assertEquals("Correlated Subquery is unsupported in INSERT clause.", assertThrows(GcpException.class,
+                () -> dmlWithSchemas(merge + "(SELECT MAX(name) v FROM ds.lookup WHERE lk = v))")).getMessage());
+    }
+
+    /**
+     * {@code ds.t} and {@code ds.s} share {@code id} and {@code v}; {@code ds.lookup} has {@code lk, name},
+     * {@code ds.a} has {@code a_col} and {@code ds.b} has {@code v}.
+     */
+    private static String dmlWithSchemas(String sql) {
+        Map<String, Set<String>> columns = Map.of("t", Set.of("id", "v"), "s", Set.of("id", "v", "only_in_source"),
+                "lookup", Set.of("lk", "name"), "a", Set.of("a_col"), "b", Set.of("v"));
+        return SqlDialectTranslator.translateDml(sql, "test-project", "ds", SqlDialectTranslator.QueryParameters.none(),
+                ref -> columns.get(ref.tableId())).sql();
+    }
+
+    @Test
     void insertSelectStagesTheSourceTable() {
         SqlDialectTranslator.Translation t = SqlDialectTranslator.translateDml(
                 "INSERT INTO ds.t SELECT * FROM ds.src WHERE x > 1", "test-project", "ds",
