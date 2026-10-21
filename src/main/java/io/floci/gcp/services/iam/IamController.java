@@ -69,6 +69,13 @@ public class IamController {
         return Response.status(Response.Status.NOT_FOUND).build();
     }
 
+    @POST
+    @Path("/{rest:[^/]+/serviceAccounts/[^/]+}:getIamPolicy")
+    @Consumes({MediaType.APPLICATION_JSON, MediaType.APPLICATION_FORM_URLENCODED})
+    public Response getIamPolicy(@PathParam("rest") String rest) {
+        return post(rest + ":getIamPolicy", null);
+    }
+
     // UpdateServiceAccount: PUT /v1/projects/{project}/serviceAccounts/{email} with the
     // ServiceAccount as the body.
     @PUT
@@ -148,6 +155,7 @@ public class IamController {
     }
 
     @DELETE
+    @Consumes({MediaType.APPLICATION_JSON, MediaType.APPLICATION_FORM_URLENCODED})
     @Path("/{rest:.+}")
     public Response delete(@PathParam("rest") String rest) {
         IamPath p = parsePath(rest);
@@ -171,7 +179,9 @@ public class IamController {
 
     @SuppressWarnings("unchecked")
     private Response handleCustomMethod(IamPath p, Map<String, Object> body) {
-        String resource = service.serviceAccountResource(p.project(), p.identifier());
+        String resource = "testIamPermissions".equals(p.customMethod())
+                ? "projects/" + p.project() + "/serviceAccounts/" + p.identifier()
+                : service.serviceAccountResource(p.project(), p.identifier());
         return switch (p.customMethod()) {
             case "getIamPolicy" -> {
                 StoredPolicy policy = service.getPolicy(resource);
