@@ -15,7 +15,7 @@ floci-gcp acts as an open-source alternative to the GCP-provided emulators, unif
 - Port: 4588
 - Stack:
   - Java 25
-  - Quarkus 3.38.3
+  - Quarkus 3.39.5
   - JUnit 5
   - RestAssured
   - Jackson
@@ -267,7 +267,8 @@ Every suite receives the same endpoint variables: `FLOCI_GCP_ENDPOINT`, `FLOCI_E
 
 The Java job additionally starts an isolated native emulator with IAM enforcement on and runs
 `IamEnforcementTest`, `IamServiceAccountIamEnforcementTest`, `CloudRunIamEnforcementTest`,
-and `PubSubIamEnforcementTest` with `FLOCI_GCP_IAM_TEST_ENFORCEMENT=true`. Its JUnit XML is stored
+`PubSubIamEnforcementTest`, and `LoggingExportIamEnforcementTest` with
+`FLOCI_GCP_IAM_TEST_ENFORCEMENT=true`. Its JUnit XML is stored
 under `/results` in a separate `test-results/iam` host directory. The ordinary Java suite
 still runs with enforcement disabled.
 
