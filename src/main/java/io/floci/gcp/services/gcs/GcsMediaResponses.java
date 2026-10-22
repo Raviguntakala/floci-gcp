@@ -2,6 +2,8 @@ package io.floci.gcp.services.gcs;
 
 import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.services.gcs.model.GcsObjectMeta;
+import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
 
 import java.io.ByteArrayInputStream;
@@ -56,6 +58,43 @@ final class GcsMediaResponses {
             builder.header("Content-Encoding", "gzip");
         }
         return withMetadataHeaders(builder.type(meta.getContentType()), meta).build();
+    }
+
+    /**
+     * Applies the {@code response-content-disposition} and {@code response-content-type} query
+     * parameters of an XML API GET. Cloud Storage lets them override the response headers, which is
+     * how a signed URL sets the download's file name or serves it inline.
+     */
+    static Response withResponseOverrides(Response response, MultivaluedMap<String, String> query) {
+        // A value the HTTP layer would refuse is ignored, as before overrides were supported,
+        // so it cannot turn a working read into a 500 or a dropped connection.
+        String disposition = query.getFirst("response-content-disposition");
+        if (!isValidHeaderValue(disposition)) {
+            disposition = null;
+        }
+        MediaType contentType = parseMediaType(query.getFirst("response-content-type"));
+        if (disposition == null && contentType == null) {
+            return response;
+        }
+        Response.ResponseBuilder builder = Response.fromResponse(response);
+        if (disposition != null) {
+            builder.header("Content-Disposition", null).header("Content-Disposition", disposition);
+        }
+        if (contentType != null) {
+            builder.type(contentType);
+        }
+        return builder.build();
+    }
+
+    private static MediaType parseMediaType(String value) {
+        if (!isValidHeaderValue(value) || value.isBlank()) {
+            return null;
+        }
+        try {
+            return MediaType.valueOf(value);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
     }
 
     private static boolean isGzipStored(GcsObjectMeta meta) {
