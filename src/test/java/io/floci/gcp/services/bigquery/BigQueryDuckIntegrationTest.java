@@ -347,6 +347,81 @@ class BigQueryDuckIntegrationTest {
 
     @Test
     @Order(5)
+    void arraySubscriptsMatchBigQuery() {
+        query("""
+                {"query": "SELECT [10,20,30][OFFSET(1)] o, [10,20,30][SAFE_OFFSET(5)] so, [10,20,30][ORDINAL(1)] ord, [10,20,30][SAFE_ORDINAL(9)] sord, [10,20,30][SAFE_OFFSET(NULL)] n", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("schema.fields.name", equalTo(List.of("o", "so", "ord", "sord", "n")))
+                .body("rows[0].f.v", equalTo(Arrays.asList("20", null, "10", null, null)));
+        // A bare subscript is also GoogleSQL's JSON subscript operator, so it is left as it is.
+        query("""
+                {"query": "WITH t AS (SELECT JSON '{\\"a\\":[1,2]}' AS j, JSON '[5,6]' AS k) SELECT j['a'] field, j['a'][1] field_index, TO_JSON(STRUCT(1 AS x))['x'] to_json_field, k[0] index0, j.a[1] dotted_index, JSON_QUERY(j, '$.a')[0] json_query_index FROM t", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("rows[0].f.v", equalTo(List.of("[1,2]", "2", "1", "5", "2", "1")));
+        query("""
+                {"query": "SELECT json_value.class.students[0]['name'] AS first_student FROM UNNEST([JSON '{\\"class\\" : {\\"students\\" : [{\\"name\\" : \\"Jane\\"}]}}', JSON '{\\"class\\" : {\\"students\\" : []}}', JSON '{\\"class\\" : {\\"students\\" : [{\\"name\\" : \\"John\\"}, {\\"name\\": \\"Jamie\\"}]}}']) AS json_value", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("rows.f.v", equalTo(Arrays.asList(List.of("\"Jane\""), Arrays.asList((Object) null), List.of("\"John\""))));
+        query("""
+                {"query": "SELECT ARRAY_AGG(x ORDER BY x DESC)[SAFE_OFFSET(0)] top, ARRAY_AGG(STRUCT(x AS v) ORDER BY x)[OFFSET(0)].v low FROM UNNEST([3,1,2]) x", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("rows[0].f.v", equalTo(List.of("3", "1")));
+        query("""
+                {"query": "SELECT t.a[SAFE_OFFSET(0)] f, SPLIT('a,b,c')[OFFSET(2)] s FROM (SELECT [7,8] a) t", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("rows[0].f.v", equalTo(List.of("7", "c")));
+        query("""
+                {"query": "SELECT [10,20,30][OFFSET(5)]", "useLegacySql": false}
+                """)
+                .then().statusCode(400)
+                .body("error.message", containsString("Array index 5 is out of bounds (overflow)"));
+        query("""
+                {"query": "SELECT [10,20,30][ORDINAL(0)]", "useLegacySql": false}
+                """)
+                .then().statusCode(400)
+                .body("error.message", containsString("Array index 0 is out of bounds (underflow)"));
+        query("""
+                {"query": "SELECT [STRUCT([10, 20] AS a)][SAFE_OFFSET(0)].a[SAFE_OFFSET(1)] AS v", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("rows[0].f.v", equalTo(List.of("20")));
+        query("""
+                {"query": "SELECT ARRAY_AGG(x) OVER ()[SAFE_OFFSET(0)] AS v FROM UNNEST([1, 2]) x", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("rows.f.v", equalTo(List.of(List.of("1"), List.of("1"))));
+        query("""
+                {"query": "SELECT [10, 20][SAFE_OFFSET(?)] AS v, [?, 20][OFFSET(?)] AS w",
+                 "parameterMode": "POSITIONAL", "useLegacySql": false,
+                 "queryParameters": [{"parameterType": {"type": "INT64"}, "parameterValue": {"value": "1"}},
+                                     {"parameterType": {"type": "INT64"}, "parameterValue": {"value": "5"}},
+                                     {"parameterType": {"type": "INT64"}, "parameterValue": {"value": "1"}}]}
+                """)
+                .then().statusCode(200)
+                .body("rows[0].f.v", equalTo(List.of("20", "20")));
+        query("""
+                {"query": "SELECT [10][SAFE_OFFSET(@i)] AS v, [10][SAFE_ORDINAL(@i)] AS w",
+                 "parameterMode": "NAMED", "useLegacySql": false,
+                 "queryParameters": [{"name": "i", "parameterType": {"type": "INT64"}, "parameterValue": {"value": "9223372036854775807"}}]}
+                """)
+                .then().statusCode(200)
+                .body("rows[0].f.v", equalTo(Arrays.asList(null, null)));
+        query("""
+                {"query": "SELECT [10][OFFSET(@i)] AS v",
+                 "parameterMode": "NAMED", "useLegacySql": false,
+                 "queryParameters": [{"name": "i", "parameterType": {"type": "INT64"}, "parameterValue": {"value": "9223372036854775807"}}]}
+                """)
+                .then().statusCode(400)
+                .body("error.message", containsString("Array index 9223372036854775807 is out of bounds (overflow)"));
+    }
+
+    @Test
+    @Order(5)
     void intervalStepSizeCanBeAnExpression() {
         query("""
                 {"query": "SELECT DATE_ADD(DATE '2024-01-10', INTERVAL -5 DAY) minus, DATE_ADD(DATE '2024-01-10', INTERVAL - 5 DAY) spaced, DATE_ADD(DATE '2024-01-10', INTERVAL 2 * 3 DAY) product, DATE_ADD(DATE '2024-01-10', INTERVAL -x DAY) negated FROM UNNEST([2]) x", "useLegacySql": false}

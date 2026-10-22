@@ -193,6 +193,164 @@ final class SqlDialectTranslator {
     }
 
     /**
+     * GoogleSQL array subscripts are 0-based ({@code arr[OFFSET(i)]}) or 1-based ({@code arr[ORDINAL(i)]}).
+     * The plain forms fail on an index outside the array, the {@code SAFE_} forms return NULL. A bare
+     * {@code x[i]} is left as it is: GoogleSQL's JSON subscript operator has that form too
+     * ({@code json[0]}, {@code json['field']}), and a JSON value cannot be told from an array by its tokens. DuckDB lists are 1-based, return NULL out of range and count a negative index from
+     * the end, so every subscript is rewritten to a CASE over the array and the index: a {@code SAFE_} form
+     * is NULL out of range, a plain form raises BigQuery's error. The bounds are checked before the index is
+     * moved to DuckDB's 1-based one, so the largest INT64 is out of range rather than an overflow. The array
+     * and the index are bound once, as the fields of a struct a one-element {@code list_transform} reads, so
+     * each is written (and each positional parameter consumed) once and in its own order, and a chain of
+     * subscripts grows linearly. The brackets written here are RAW tokens, so a rewritten subscript is not
+     * seen again; scanning resumes at the array, so nested ones are too.
+     * Only the DuckDB renderings run it, not {@link #prepare}: a CREATE TABLE/VIEW keeps its query as
+     * GoogleSQL text and translates it again when it runs, and this rewrite is not idempotent.
+     */
+    private void rewriteArraySubscripts() {
+        int i = 0;
+        while (i < tokens.size()) {
+            Token t = tokens.get(i);
+            int previous = previousSignificant(i);
+            if (!t.isPunct("[") || previous < 0 || !endsArrayOperand(tokens.get(previous))) {
+                i++;
+                continue;
+            }
+            int close = matchingBracket(i);
+            int first = nextSignificant(i + 1, close);
+            String accessor = first >= 0 ? tokens.get(first).upper() : "";
+            boolean wrapped = Set.of("OFFSET", "SAFE_OFFSET", "ORDINAL", "SAFE_ORDINAL").contains(accessor)
+                    && tokens.get(first).kind == Kind.IDENT;
+            if (!wrapped) {
+                i++;
+                continue;
+            }
+            int open = nextSignificant(first + 1, close);
+            if (open < 0 || !tokens.get(open).isPunct("(") || nextSignificant(matchingParen(open) + 1, close) >= 0) {
+                throw invalidQuery("Syntax error: Expected \")\" after " + accessor + " in an array subscript");
+            }
+            int indexFrom = open + 1;
+            int indexTo = matchingParen(open);
+            List<Token> index = new ArrayList<>(tokens.subList(indexFrom, indexTo));
+            int ordinalBase = accessor.endsWith("ORDINAL") ? 1 : 0;
+            int start = arrayOperandStart(previous);
+            List<Token> array = new ArrayList<>(tokens.subList(start, i));
+            String bound = ordinalBase == 0 ? "" : " + 1";
+            String position = ordinalBase == 0 ? "_s.i + 1" : "_s.i";
+            String body = accessor.startsWith("SAFE_")
+                    ? "CASE WHEN _s.i >= " + ordinalBase + " AND _s.i < len(_s.a)" + bound + " THEN _s.a[" + position + "] END"
+                    : "CASE WHEN _s.i IS NULL OR _s.a IS NULL THEN NULL WHEN _s.i < " + ordinalBase
+                            + " THEN error('Array index ' || CAST(_s.i AS VARCHAR) || ' is out of bounds (underflow)')"
+                            + " WHEN _s.i >= len(_s.a)" + bound
+                            + " THEN error('Array index ' || CAST(_s.i AS VARCHAR) || ' is out of bounds (overflow)')"
+                            + " ELSE _s.a[" + position + "] END";
+            List<Token> replacement = new ArrayList<>();
+            replacement.add(new Token(Kind.PUNCT, "(", "("));
+            replacement.add(Token.raw("list_transform([struct_pack(a := "));
+            replacement.addAll(array);
+            replacement.add(Token.raw(", i := "));
+            replacement.addAll(index);
+            replacement.add(Token.raw(")], lambda _s: " + body + ")[1]"));
+            replacement.add(new Token(Kind.PUNCT, ")", ")"));
+            tokens.subList(start, close + 1).clear();
+            tokens.addAll(start, replacement);
+            i = start;
+        }
+    }
+
+    /** True when {@code t} can end an array value, so a {@code [} right after it is a subscript. */
+    private static boolean endsArrayOperand(Token t) {
+        return t.kind == Kind.QIDENT || t.kind == Kind.NAMED_PARAM || t.kind == Kind.POSITIONAL_PARAM
+                || t.isPunct(")") || t.isPunct("]")
+                || (t.kind == Kind.IDENT && !GOOGLESQL_RESERVED.contains(t.upper())
+                        && !NON_ALIAS_KEYWORDS.contains(t.upper()));
+    }
+
+    /**
+     * First token of the array a subscript applies to, given its last token: a dotted path, a function
+     * call (with its {@code OVER} clause), a parenthesized expression, an array literal or another
+     * subscript, and any field access after a call, a parenthesized expression or a subscript.
+     */
+    private int arrayOperandStart(int last) {
+        Token t = tokens.get(last);
+        int start;
+        if (t.isPunct(")")) {
+            start = matchingOpen(last, "(", ")");
+            int name = previousSignificant(start);
+            if (name >= 0 && tokens.get(name).isKeyword("OVER")) {
+                int call = previousSignificant(name);
+                return call >= 0 && tokens.get(call).isPunct(")") ? arrayOperandStart(call) : start;
+            }
+            if (name >= 0 && tokens.get(name).kind == Kind.IDENT && (endsArrayOperand(tokens.get(name))
+                    || Set.of("IF", "CAST", "EXTRACT", "ARRAY").contains(tokens.get(name).upper()))) {
+                start = name;
+            }
+        } else if (t.isPunct("]")) {
+            start = matchingOpen(last, "[", "]");
+            int before = previousSignificant(start);
+            if (before >= 0 && tokens.get(before).isKeyword("ARRAY")) {
+                return before;
+            }
+            if (before >= 0 && endsArrayOperand(tokens.get(before))) {
+                return arrayOperandStart(before);
+            }
+            return start;
+        } else {
+            start = last;
+            int over = previousSignificant(last);
+            if (over >= 0 && tokens.get(over).isKeyword("OVER")) {
+                int call = previousSignificant(over);
+                return call >= 0 && tokens.get(call).isPunct(")") ? arrayOperandStart(call) : start;
+            }
+        }
+        int dot = previousSignificant(start);
+        while (dot >= 0 && tokens.get(dot).isPunct(".")) {
+            int name = previousSignificant(dot);
+            if (name >= 0 && (tokens.get(name).isPunct(")") || tokens.get(name).isPunct("]"))) {
+                return arrayOperandStart(name);
+            }
+            if (name < 0 || !(tokens.get(name).kind == Kind.IDENT || tokens.get(name).kind == Kind.QIDENT)) {
+                break;
+            }
+            start = name;
+            dot = previousSignificant(start);
+        }
+        return start;
+    }
+
+    private int previousSignificant(int before) {
+        int k = before - 1;
+        while (k >= 0 && tokens.get(k).kind == Kind.SPACE) {
+            k--;
+        }
+        return k;
+    }
+
+    private int matchingBracket(int open) {
+        int depth = 0;
+        for (int k = open; k < tokens.size(); k++) {
+            if (tokens.get(k).isPunct("[")) {
+                depth++;
+            } else if (tokens.get(k).isPunct("]") && --depth == 0) {
+                return k;
+            }
+        }
+        throw invalidQuery("Syntax error: Unclosed \"[\"");
+    }
+
+    private int matchingOpen(int close, String openText, String closeText) {
+        int depth = 0;
+        for (int k = close; k >= 0; k--) {
+            if (tokens.get(k).isPunct(closeText)) {
+                depth++;
+            } else if (tokens.get(k).isPunct(openText) && --depth == 0) {
+                return k;
+            }
+        }
+        throw invalidQuery("Syntax error: Unexpected \"" + closeText + "\"");
+    }
+
+    /**
      * GoogleSQL does not reserve OFFSET, so {@code offset} is an ordinary name (a column, or an alias as
      * in {@code SELECT 1 offset}), while DuckDB reserves it. Every {@code offset} that is not the
      * {@code LIMIT … OFFSET} clause, {@code WITH OFFSET} or the {@code OFFSET(n)} array subscript
@@ -436,6 +594,7 @@ final class SqlDialectTranslator {
 
     private Translation runDml(String sql) {
         prepare(sql);
+        rewriteArraySubscripts();
         List<Integer> sig = significantIndexes();
         String first = tokens.get(sig.getFirst()).upper();
         int at = 1;
@@ -1446,6 +1605,7 @@ final class SqlDialectTranslator {
 
     private Translation run(String sql) {
         prepare(sql);
+        rewriteArraySubscripts();
         String statement = statementType(sql);
         if (!statement.equals("SELECT")) {
             throw invalidQuery("Statement type " + statement + " is not supported by the floci BigQuery"
