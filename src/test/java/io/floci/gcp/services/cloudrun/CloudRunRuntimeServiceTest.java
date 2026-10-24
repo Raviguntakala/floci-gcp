@@ -38,6 +38,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -60,6 +62,7 @@ class CloudRunRuntimeServiceTest {
         when(config.docker().logMaxSize()).thenReturn("10m");
         when(config.docker().logMaxFile()).thenReturn("3");
         when(config.docker().resourceNamespace()).thenReturn(Optional.empty());
+        when(config.docker().apiTimeout()).thenReturn(Duration.ofSeconds(30));
 
         DockerHostResolver dockerHostResolver = mock(DockerHostResolver.class);
         when(dockerHostResolver.isLinuxHost()).thenReturn(false);
@@ -545,6 +548,165 @@ class CloudRunRuntimeServiceTest {
                 "gcr.io/p1/svc:latest", containerId, 8080, null, "127.0.0.1", endpointPort,
                 "http://localhost:4588/run/v2/projects/p1/locations/us-central1/services/svc",
                 "READY", createTimeMillis, createTimeMillis, null, 300_000, mounts);
+    }
+
+    @Test
+    void startupSweepRemovesOnlyOwnedServiceContainersWithoutARuntimeRecord() {
+        InMemoryStorage<String, CloudRunRuntimeInstance> store = new InMemoryStorage<>();
+        String recordedRevision = "projects/p1/locations/us-central1/services/svc/revisions/svc-00002";
+        store.put(recordedRevision, instance(recordedRevision, 8080, "recorded", 1));
+        CloudRunRuntimeService service = new CloudRunRuntimeService(store, containerBuilder(), lifecycleManager,
+                config);
+        String revisions = "projects/p1/locations/us-central1/services/svc/revisions/";
+        String owner = ContainerStorageHelper.ownerIdentity(config);
+        List<com.github.dockerjava.api.model.Container> containers = List.of(
+                dockerContainer("orphan", revisions + "svc-00001", owner),
+                dockerContainer("recorded", recordedRevision, owner),
+                dockerContainer("foreign", revisions + "svc-00003", "other-floci/4588"),
+                dockerContainer("pool", "projects/p1/locations/us-central1/workerPools/pool/revisions/pool-1", owner));
+        when(lifecycleManager.listContainersByLabels(anyString(), anyMap())).thenReturn(containers);
+
+        assertEquals(1, service.removeLeftoverServiceContainers());
+
+        verify(lifecycleManager).forceRemove("orphan", null);
+        verify(lifecycleManager, never()).forceRemove(eq("recorded"), any());
+        verify(lifecycleManager, never()).forceRemove(eq("foreign"), any());
+        verify(lifecycleManager, never()).forceRemove(eq("pool"), any());
+    }
+
+    @Test
+    void shutdownRemovesServiceContainersWhenTheRecordsDoNotOutliveTheProcess() {
+        InMemoryStorage<String, CloudRunRuntimeInstance> store = new InMemoryStorage<>();
+        String revision = "projects/p1/locations/us-central1/services/svc/revisions/svc-00001";
+        store.put(revision, instance(revision, 8080, "service-container", 1));
+        CloudRunRuntimeService service = new CloudRunRuntimeService(store, containerBuilder(), lifecycleManager,
+                config);
+        when(config.storage().mode()).thenReturn("memory");
+
+        service.stopManagedContainers();
+
+        verify(lifecycleManager).forceRemove("service-container", null);
+        assertTrue(store.get(revision).isEmpty());
+    }
+
+    @Test
+    void shutdownKeepsServiceContainersForTheNextProcessWithPersistentStorage() {
+        InMemoryStorage<String, CloudRunRuntimeInstance> store = new InMemoryStorage<>();
+        String revision = "projects/p1/locations/us-central1/services/svc/revisions/svc-00001";
+        store.put(revision, instance(revision, 8080, "service-container", 1));
+        CloudRunRuntimeService service = new CloudRunRuntimeService(store, containerBuilder(), lifecycleManager,
+                config);
+        when(config.storage().mode()).thenReturn("persistent");
+
+        service.stopManagedContainers();
+
+        verify(lifecycleManager, never()).forceRemove(anyString(), any());
+        assertTrue(store.get(revision).isPresent());
+    }
+
+    @Test
+    void teardownWaitsForAServiceContainerStillStartingAndRemovesIt() throws Exception {
+        when(config.storage().mode()).thenReturn("memory");
+        when(config.services().cloudrun().execution().startupTimeout()).thenReturn(Duration.ofSeconds(30));
+        CountDownLatch creating = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        ContainerLifecycleManager.ContainerInfo created = new ContainerLifecycleManager.ContainerInfo(
+                "starting-container", Map.of(8080, new ContainerLifecycleManager.EndpointInfo("127.0.0.1", 1)));
+        when(lifecycleManager.createAndStart(any())).thenAnswer(invocation -> {
+            creating.countDown();
+            release.await(10, TimeUnit.SECONDS);
+            return created;
+        });
+        Thread starter = new Thread(() -> {
+            try {
+                runtimeService.start("p1", "us-central1", service(), revision());
+            } catch (RuntimeException expected) {
+                // The readiness wait ends when the test interrupts it.
+            }
+        });
+        starter.start();
+        assertTrue(creating.await(5, TimeUnit.SECONDS));
+
+        Thread teardown = new Thread(runtimeService::stopManagedContainers);
+        teardown.start();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (teardown.isAlive() && teardown.getState() != Thread.State.TIMED_WAITING
+                && System.nanoTime() < deadline) {
+            Thread.onSpinWait();
+        }
+        release.countDown();
+        teardown.join(15_000);
+
+        // Removed exactly once: the start sees teardown began and removes its own container before recording it.
+        verify(lifecycleManager).forceRemove("starting-container", null);
+        starter.interrupt();
+        starter.join(15_000);
+    }
+
+    @Test
+    void aStartThatOutlastsTeardownsWaitRemovesItsOwnContainer() throws Exception {
+        when(config.storage().mode()).thenReturn("memory");
+        when(config.docker().apiTimeout()).thenReturn(Duration.ofMillis(1));
+        CountDownLatch creating = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        when(lifecycleManager.createAndStart(any())).thenAnswer(invocation -> {
+            creating.countDown();
+            release.await(10, TimeUnit.SECONDS);
+            return new ContainerLifecycleManager.ContainerInfo("late-container",
+                    Map.of(8080, new ContainerLifecycleManager.EndpointInfo("127.0.0.1", 1)));
+        });
+        Thread starter = new Thread(() -> {
+            try {
+                runtimeService.start("p1", "us-central1", service(), revision());
+            } catch (RuntimeException expected) {
+                // The start fails once it sees teardown began.
+            }
+        });
+        starter.start();
+        assertTrue(creating.await(5, TimeUnit.SECONDS));
+
+        runtimeService.stopManagedContainers();
+        verify(lifecycleManager, never()).forceRemove(any(), any());
+        release.countDown();
+        starter.join(15_000);
+
+        verify(lifecycleManager).forceRemove("late-container", null);
+    }
+
+    @Test
+    void noServiceContainerStartsOnceTeardownBegan() {
+        when(config.storage().mode()).thenReturn("memory");
+        runtimeService.stopManagedContainers();
+
+        GcpException e = assertThrows(GcpException.class,
+                () -> runtimeService.start("p1", "us-central1", service(), revision()));
+
+        assertTrue(e.getMessage().contains("shutting down"), e.getMessage());
+        verify(lifecycleManager, never()).createAndStart(any());
+    }
+
+    private static Service service() {
+        return Service.newBuilder().setName("projects/p1/locations/us-central1/services/svc").build();
+    }
+
+    private static Revision revision() {
+        return Revision.newBuilder()
+                .setName("projects/p1/locations/us-central1/services/svc/revisions/svc-00001")
+                .setUid("revision-uid")
+                .addContainers(Container.newBuilder().setImage("gcr.io/p1/svc:latest"))
+                .build();
+    }
+
+    private static com.github.dockerjava.api.model.Container dockerContainer(String id, String resourceName,
+                                                                            String owner) {
+        com.github.dockerjava.api.model.Container container = mock(com.github.dockerjava.api.model.Container.class);
+        when(container.getId()).thenReturn(id);
+        when(container.getLabels()).thenReturn(Map.of(
+                "floci_emulator", "floci-gcp",
+                ContainerStorageHelper.SERVICE_LABEL, "cloudrun",
+                "io.floci.cloudrun.resource-name", resourceName,
+                ContainerStorageHelper.OWNER_LABEL, owner));
+        return container;
     }
 
     private ContainerBuilder containerBuilder() {
